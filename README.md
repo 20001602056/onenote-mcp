@@ -138,3 +138,7 @@ ONENOTE_BLOCKED_SECTIONS="Credentials,0-ABC123...!12345" npm run test:guardrail
 
 - Delete the tokens: on macOS, remove the `onenote-mcp` item in Keychain Access; elsewhere, delete `~/.config/onenote-mcp/tokens.json`.
 - Remove the app's consent at https://account.live.com/consent/Manage (personal accounts) or https://myapps.microsoft.com (work/school).
+
+## License
+
+[MIT](LICENSE)

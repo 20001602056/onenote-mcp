@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "OneNote MCP server for Claude and other MCP clients (Microsoft Graph, device-code sign-in, no app registration)",
+  "license": "MIT",
   "engines": {
     "node": ">=18"
   },
