@@ -30,7 +30,7 @@ Sections are identified by `sectionId`, or by `notebook` + `section` names.
 ### 1. Get the code
 
 ```bash
-git clone https://github.com/<your-user>/onenote-mcp.git
+git clone https://github.com/20001602056/onenote-mcp.git
 cd onenote-mcp
 npm install
 ```
