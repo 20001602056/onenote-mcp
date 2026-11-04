@@ -5,20 +5,61 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 - **No Azure app registration.** It signs in as you with Microsoft's public "Microsoft Graph Command Line Tools" client, using device-code login.
 - **Tokens stay on your machine:** in the macOS Keychain, or in a `0600` file on Linux and Windows. They refresh automatically.
 - **Optional guardrail:** block sections (for example, one holding passwords) from every tool.
+- **Safety switches:** read-only mode, and page deletion that stays off unless you turn it on.
 
 ## Tools
 
+Each tool tells your MCP client whether it only reads, writes, or can destroy content, so clients can ask before risky actions.
+
+**Notebooks and structure**
+
 | Tool | What it does |
 |---|---|
-| `list_notebooks` | List notebooks and their sections |
-| `create_section` | Create a section in a notebook (or return the existing one) |
-| `list_pages` | List pages in a section, newest first |
-| `search_pages` | Search page titles in a section |
-| `read_page` | Read a page's content as HTML |
-| `create_page` | Create a page from simple HTML |
-| `append_to_page` | Append HTML to the end of a page |
+| `list_notebooks` | Full tree of every notebook: nested section groups and sections, with ids, default/shared flags and links |
+| `get_recent_notebooks` | Recently opened notebooks, with last-access time and links |
+| `create_notebook` | Create a notebook (or return the existing one) |
+| `create_section_group` | Create a section group in a notebook or nested inside another group |
+| `list_sections` | Every section, including those inside section groups, optionally for one notebook |
+| `create_section` | Create a section in a notebook or a section group |
+| `copy_section` | Copy a section and all its pages into another notebook or section group |
 
-Sections are identified by `sectionId`, or by `notebook` + `section` names.
+**Pages**
+
+| Tool | What it does |
+|---|---|
+| `list_pages` | Pages in a section, with indent level and order; choose sort order and limit |
+| `search_pages` | Search page titles in one section, one notebook, or everywhere |
+| `get_page` | Page details: section, notebook, links and a short text preview |
+| `read_page` | Full page HTML; optionally with element ids for precise edits |
+| `create_page` | New page from HTML, with tags, web images and local images/files |
+| `update_page` | Edit in place: rename, replace/insert/append/prepend at any element, tick to-dos, add attachments |
+| `append_to_page` | Append HTML (and attachments) to the end of a page |
+| `copy_page` | Copy a page with its images and files to another section (copy + delete = move) |
+| `delete_page` | Delete a page (only when `ONENOTE_ALLOW_DELETE=true`) |
+| `download_resource` | Save an image or attached file from a page to disk |
+| `get_operation` | Check a background copy (work/school accounts) |
+| `server_settings` | Show the server's active settings |
+
+Sections are identified by `sectionId`, or by `notebook` + `section` names (+ `sectionGroup` for a section inside a group). With `ONENOTE_DEFAULT_NOTEBOOK` and `ONENOTE_DEFAULT_SECTION` set, you can leave them out.
+
+### Page content tips
+
+- **Tags:** `<p data-tag="to-do">Buy milk</p>`. Other tags: `to-do:completed`, `important`, `question`, `idea`, `critical`, `contact`, `remember-for-later`, `definition`, `highlight`, and more.
+- **Ticking a to-do:** give the line a `data-id` when you create it, then `update_page` with `{target: "#my-id", action: "replace", content: "<p data-tag=\"to-do:completed\" data-id=\"my-id\">Done</p>"}`.
+- **Images from the web:** `<img src="https://..." />`. OneNote downloads and embeds them.
+- **Local images and files:** pass `attachments: [{ path: "~/Pictures/chart.png" }]`. Reference them as `name:file1`, or leave them unreferenced and they're added at the end.
+- **Renaming a page:** `update_page` with `{target: "title", action: "replace", content: "New title"}`.
+
+### What Microsoft Graph doesn't support
+
+These OneNote features aren't available through Graph, so no OneNote MCP server can provide them:
+
+- OneNote **app settings** (themes, sync options, proofing, etc.)
+- **Renaming or deleting** notebooks, section groups or sections (pages can be renamed and deleted)
+- Setting a page's **indent level or order**, section colors, or page templates
+- Ink/drawings as editable strokes, audio recording, password-protected sections
+
+On **personal Microsoft accounts**, Graph's built-in copy isn't available. `copy_page` and `copy_section` copy content by hand instead (read → download images/files → recreate). The result is the same content, but the copy has a new created date.
 
 ## Requirements
 
@@ -94,6 +135,11 @@ All settings are environment variables. Set them in your MCP client's server con
 | Variable | Default | Purpose |
 |---|---|---|
 | `ONENOTE_BLOCKED_SECTIONS` | *(empty)* | Comma-separated section names and/or ids that every tool must refuse |
+| `ONENOTE_READ_ONLY` | `false` | `true` hides every tool that changes OneNote or writes files |
+| `ONENOTE_ALLOW_DELETE` | `false` | `true` enables `delete_page` (ignored in read-only mode) |
+| `ONENOTE_DEFAULT_NOTEBOOK` | *(none)* | Notebook used when a tool call names no notebook |
+| `ONENOTE_DEFAULT_SECTION` | *(none)* | Section used when a tool call names no section |
+| `ONENOTE_DOWNLOAD_DIR` | `~/Downloads` | Where `download_resource` saves files when no path is given |
 | `ONENOTE_TENANT` | `consumers` | Sign-in authority: `consumers` (personal), `organizations`, `common`, or a tenant id |
 | `ONENOTE_CLIENT_ID` | Graph CLI public client | Use your own app registration instead |
 | `ONENOTE_TOKEN_FILE` | see above | Store tokens in this file (also on macOS, instead of the Keychain) |
@@ -129,6 +175,10 @@ export ONENOTE_TEST_SECTION="Quick Notes"
 
 npm run test:read        # lists tools, notebooks and pages in the section
 npm run test:write       # creates a "Test from onenote-mcp" page (delete it afterwards)
+
+# full test of every page tool: create, tags, attachments, edits, download, copy.
+# With delete enabled it removes the pages it created; otherwise delete them by hand.
+ONENOTE_ALLOW_DELETE=true npm run test:features
 
 # guardrail test: also needs a blocked section name + id in the same notebook
 ONENOTE_BLOCKED_SECTIONS="Credentials,0-ABC123...!12345" npm run test:guardrail
