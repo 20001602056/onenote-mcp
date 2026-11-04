@@ -1,0 +1,6 @@
+node_modules/
+# Personal docs generator: content about private projects, kept local only.
+projects-docs/
+.DS_Store
+*.log
+tokens.json
