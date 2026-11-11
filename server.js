@@ -2,149 +2,56 @@
 // OneNote MCP server backed by Microsoft Graph (signed in as you, see auth.js).
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { basename, dirname, extname, resolve } from "node:path";
-import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { writeFile, mkdir, stat } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
-import { getAccessToken } from "./auth.js";
+import {
+  ALLOW_DELETE, DEFAULT_NOTEBOOK, DEFAULT_SECTION, DOWNLOAD_DIR, EXPORT_DIR, READ_ONLY, RETENTION_DAYS, VERSIONING, VERSION_DIR, AUDIT_LOG,
+  expandHome,
+} from "./lib/config.js";
+import { esc, getAll, graph, notFound, notImplemented, q, same } from "./lib/graph.js";
+import {
+  NEED_PATHS, RULES, assertPageAllowed, audit, checkNewPageTitle, checkNewSection, checkStored, containerPath,
+  forgetSectionGroups, isPageBlocked,
+} from "./lib/guardrail.js";
+import {
+  allSectionGroups, buildMultipart, copyPageManually, createPageFromHtml, findNotebook, findSectionGroup, pageSummary, patchPage,
+  resolveReplaceTargets, resolveSection, setTitle, visibleSections,
+} from "./lib/onenote.js";
+import { EXT, FORMATS, convert, findBrowser, localizeResources, renderCombined, renderPage, safeName, uniquePath, writeOutput } from "./lib/export.js";
+import { listVersionedPages, listVersions, prune, readVersion, snapshotPage, snapshotSections, versionResources, versionSummary } from "./lib/versions.js";
 
-const GRAPH = "https://graph.microsoft.com/v1.0/me/onenote";
-
-// ---- Settings (environment variables) ----
-const env = (name, fallback = "") => (process.env[name] ?? fallback).trim();
-const flag = (name) => ["1", "true", "yes"].includes(env(name).toLowerCase());
-const READ_ONLY = flag("ONENOTE_READ_ONLY");
-const ALLOW_DELETE = flag("ONENOTE_ALLOW_DELETE");
-const DEFAULT_NOTEBOOK = env("ONENOTE_DEFAULT_NOTEBOOK");
-const DEFAULT_SECTION = env("ONENOTE_DEFAULT_SECTION");
-const DOWNLOAD_DIR = env("ONENOTE_DOWNLOAD_DIR", resolve(homedir(), "Downloads"));
-
-// ---- Graph helpers ----
-async function graph(path, { method = "GET", body, contentType, raw = false, binary = false, full = false } = {}) {
-  const url = path.startsWith("http") ? path : GRAPH + path;
-  const headers = { Authorization: `Bearer ${await getAccessToken()}` };
-  if (contentType) headers["Content-Type"] = contentType;
-  const res = await fetch(url, { method, headers, body });
-  if (!res.ok) throw new Error(`Graph ${method} ${path} -> ${res.status}: ${await res.text()}`);
-  if (full) {
-    const textBody = await res.text();
-    return { status: res.status, location: res.headers.get("Operation-Location"), body: textBody ? JSON.parse(textBody) : null };
-  }
-  if (res.status === 204) return null;
-  if (binary) return Buffer.from(await res.arrayBuffer());
-  return raw ? res.text() : res.json();
-}
-
-async function getAll(path, limit = Infinity) {
-  const items = [];
-  let next = path;
-  while (next && items.length < limit) {
-    const r = await graph(next);
-    items.push(...r.value);
-    next = r["@odata.nextLink"];
-  }
-  return items.slice(0, limit);
-}
-
-const q = (s) => s.replace(/'/g, "''");
-const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const text = (v) => ({ content: [{ type: "text", text: typeof v === "string" ? v : JSON.stringify(v, null, 2) }] });
-const same = (a, b) => (a || "").toLowerCase() === (b || "").toLowerCase();
 
-// ---- Guardrail ----
-// Sections that must never be read, listed, searched, copied or written.
-// Matched by section name (case-insensitive) or section id, so renaming the section doesn't bypass it.
-// Set with ONENOTE_BLOCKED_SECTIONS="Name1,Name2,<sectionId>". Nothing is blocked by default.
-const BLOCKED_SECTIONS = env("ONENOTE_BLOCKED_SECTIONS")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
+// ---- Server ----
+const server = new McpServer({ name: "onenote", version: "2.1.0" });
+const RO = { readOnlyHint: true, openWorldHint: true };
+const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, openWorldHint: true };
 
-const isBlocked = (section) =>
-  BLOCKED_SECTIONS.includes((section.displayName || "").toLowerCase()) || BLOCKED_SECTIONS.includes((section.id || "").toLowerCase());
-const isBlockedName = (name) => BLOCKED_SECTIONS.includes((name || "").toLowerCase());
+// Identifying arguments recorded in the audit log (never page content).
+const AUDIT_KEYS = ["pageId", "sectionId", "notebook", "section", "sectionGroup", "name", "title", "toSectionId", "toNotebook", "toSection", "toSectionGroup", "renameAs", "versionId", "format"];
 
-const BLOCKED_MSG = "Access denied by guardrail: this section is blocked.";
-
-async function assertSectionAllowed(sectionId) {
-  const s = await graph(`/sections/${sectionId}?$select=id,displayName`);
-  if (isBlocked(s)) throw new Error(BLOCKED_MSG);
-  return s;
+function tool(name, description, inputSchema, annotations, handler) {
+  if (READ_ONLY && !annotations.readOnlyHint) return;
+  server.registerTool(name, { description, inputSchema, annotations }, async (args, extra) => {
+    const logged = Object.fromEntries(AUDIT_KEYS.filter((k) => typeof args?.[k] === "string").map((k) => [k, args[k]]));
+    try {
+      const result = await handler(args, extra);
+      if (!annotations.readOnlyHint) await audit("call", { tool: name, ...logged });
+      return result;
+    } catch (e) {
+      if (/guardrail/.test(e.message)) await audit("denied", { tool: name, ...logged, error: e.message });
+      throw e;
+    }
+  });
 }
 
-async function assertPageAllowed(pageId) {
-  const p = await graph(`/pages/${pageId}?$select=id&$expand=parentSection($select=id,displayName)`);
-  if (!p.parentSection || isBlocked(p.parentSection)) throw new Error(BLOCKED_MSG);
-}
-
-// ---- Lookups ----
-// Every section in every notebook, including sections inside section groups.
-async function allSections() {
-  return getAll(
-    "/sections?$select=id,displayName,isDefault,createdDateTime,lastModifiedDateTime" +
-      "&$expand=parentNotebook($select=id,displayName),parentSectionGroup($select=id,displayName)"
-  );
-}
-
-async function allSectionGroups() {
-  return getAll("/sectionGroups?$select=id,displayName&$expand=parentNotebook($select=id,displayName),parentSectionGroup($select=id,displayName)");
-}
-
-async function findNotebook(name) {
-  const nbs = await getAll(`/notebooks?$filter=displayName eq '${q(name)}'&$select=id,displayName`);
-  if (!nbs.length) throw new Error(`Notebook "${name}" not found`);
-  return nbs[0];
-}
-
-async function findSectionGroup(notebookName, groupName) {
-  const groups = (await allSectionGroups()).filter((g) => same(g.parentNotebook?.displayName, notebookName) && same(g.displayName, groupName));
-  if (!groups.length) throw new Error(`Section group "${groupName}" not found in notebook "${notebookName}"`);
-  return groups[0];
-}
-
-async function findSection(notebookName, sectionName, sectionGroupName) {
-  if (isBlockedName(sectionName)) throw new Error(BLOCKED_MSG);
-  const inNotebook = (await allSections()).filter((s) => same(s.parentNotebook?.displayName, notebookName) && !isBlocked(s));
-  if (!inNotebook.length) throw new Error(`Notebook "${notebookName}" not found or has no sections`);
-  const matches = inNotebook.filter(
-    (s) => same(s.displayName, sectionName) && (!sectionGroupName || same(s.parentSectionGroup?.displayName, sectionGroupName))
-  );
-  if (!matches.length) {
-    throw new Error(`Section "${sectionName}" not found. Available: ${inNotebook.map((s) => s.displayName).join(", ")}`);
-  }
-  // Prefer a top-level section when the same name exists inside a section group too.
-  return matches.find((s) => !s.parentSectionGroup) || matches[0];
-}
-
-async function resolveSection({ sectionId, notebook, section, sectionGroup }) {
-  if (sectionId) return (await assertSectionAllowed(sectionId)).id;
-  notebook ||= DEFAULT_NOTEBOOK;
-  section ||= DEFAULT_SECTION;
-  if (!notebook || !section) {
-    throw new Error("Provide sectionId, or notebook + section (or set ONENOTE_DEFAULT_NOTEBOOK / ONENOTE_DEFAULT_SECTION)");
-  }
-  return (await findSection(notebook, section, sectionGroup)).id;
-}
-
-const pageSummary = (p) => ({
-  title: p.title,
-  id: p.id,
-  created: p.createdDateTime,
-  modified: p.lastModifiedDateTime,
-  ...(p.level !== undefined && { level: p.level, order: p.order }),
-  ...(p.parentSection && { section: p.parentSection.displayName, sectionId: p.parentSection.id }),
-  ...(p.links && { webUrl: p.links.oneNoteWebUrl?.href, clientUrl: p.links.oneNoteClientUrl?.href }),
-});
-
-// ---- Attachments (images and files embedded in pages) ----
-const MIME = {
-  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".bmp": "image/bmp",
-  ".tif": "image/tiff", ".tiff": "image/tiff", ".pdf": "application/pdf", ".txt": "text/plain", ".csv": "text/csv",
-  ".json": "application/json", ".zip": "application/zip", ".doc": "application/msword",
-  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+const sectionTarget = {
+  sectionId: z.string().optional().describe("Section id (takes precedence over names)"),
+  notebook: z.string().optional().describe("Notebook name"),
+  section: z.string().optional().describe("Section name"),
+  sectionGroup: z.string().optional().describe("Section group name, to pick a section inside a group"),
 };
 
 const attachmentSchema = z
@@ -161,116 +68,21 @@ const attachmentSchema = z
       "<object data=\"name:file1\" data-attachment=\"report.pdf\" type=\"application/pdf\"/>. Unreferenced parts are added at the end automatically."
   );
 
-// Hand-built multipart/form-data body (Graph rejects some FormData encodings).
-function multipart(parts) {
-  const boundary = `onenote-mcp-${randomUUID()}`;
-  const chunks = [];
-  for (const p of parts) {
-    const disposition = `form-data; name="${p.name}"${p.filename ? `; filename="${p.filename.replace(/"/g, "")}"` : ""}`;
-    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: ${disposition}\r\nContent-Type: ${p.type}\r\n\r\n`));
-    chunks.push(Buffer.isBuffer(p.data) ? p.data : Buffer.from(p.data), Buffer.from("\r\n"));
+const readFormat = z.enum(["html", "markdown", "text"]).optional().describe("html (default), markdown or text");
+
+// Snapshot a page before the server changes it. Returns a warning string if the snapshot failed.
+async function snapshotBefore(page, reason, { required = false } = {}) {
+  if (!VERSIONING) return null;
+  try {
+    await snapshotPage(page, reason);
+    return null;
+  } catch (e) {
+    if (required) throw new Error(`Refusing to continue: could not save a version first (${e.message.slice(0, 200)})`);
+    return `Warning: could not save a version before this change (${e.message.slice(0, 200)})`;
   }
-  chunks.push(Buffer.from(`--${boundary}--\r\n`));
-  return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
 }
 
-// Multipart body for page create ("Presentation" HTML part) or update ("Commands" JSON part), plus local files.
-async function buildMultipart(main, attachments, mainType) {
-  let content = main;
-  const extra = [];
-  const parts = [];
-  for (const [i, a] of attachments.entries()) {
-    const part = a.partName || `file${i + 1}`;
-    const file = resolve(a.path.replace(/^~(?=$|\/)/, homedir()));
-    const type = a.contentType || MIME[extname(file).toLowerCase()] || "application/octet-stream";
-    parts.push({ name: part, data: await readFile(file), type, filename: basename(file) });
-    if (!content.includes(`name:${part}`)) {
-      extra.push(
-        type.startsWith("image/")
-          ? `<img src="name:${part}" alt="${esc(basename(file))}" />`
-          : `<object data-attachment="${esc(basename(file))}" data="name:${part}" type="${type}" />`
-      );
-    }
-  }
-  if (extra.length) {
-    if (mainType === "application/json") {
-      const ops = JSON.parse(content);
-      ops.push({ target: "body", action: "append", content: extra.join("") });
-      content = JSON.stringify(ops);
-    } else {
-      content = content.includes("</body>") ? content.replace("</body>", `${extra.join("")}</body>`) : content + extra.join("");
-    }
-  }
-  const mainName = mainType === "application/json" ? "Commands" : "Presentation";
-  return multipart([{ name: mainName, type: mainType, data: content }, ...parts]);
-}
-
-async function patchPage(pageId, ops, attachments) {
-  const json = JSON.stringify(ops);
-  const req = attachments?.length ? await buildMultipart(json, attachments, "application/json") : { body: json, contentType: "application/json" };
-  await graph(`/pages/${pageId}/content`, { method: "PATCH", ...req });
-}
-
-// Graph can only "replace" some elements (e.g. <p>) through OneNote's generated id, not a custom data-id.
-// Swap "#my-data-id" targets for the generated id when needed.
-async function resolveReplaceTargets(pageId, ops) {
-  const wanted = ops.filter((o) => o.action === "replace" && o.target.startsWith("#"));
-  if (!wanted.length) return ops;
-  const html = await graph(`/pages/${pageId}/content?includeIDs=true`, { raw: true });
-  const tags = [...html.matchAll(/<[a-z0-9]+\b[^>]*>/gi)].map((m) => m[0]);
-  const attr = (tag, name) => tag.match(new RegExp(`\\s${name}="([^"]*)"`))?.[1];
-  return ops.map((o) => {
-    if (!wanted.includes(o)) return o;
-    const key = o.target.slice(1);
-    const tag = tags.find((t) => attr(t, "data-id") === key);
-    const generated = tag && attr(tag, "id");
-    return generated ? { ...o, target: generated } : o;
-  });
-}
-
-// Copy a page by reading it, downloading its images/files and recreating it (personal accounts
-// don't support Graph's copyToSection).
-async function copyPageManually(pageId, destSectionId) {
-  let html = await graph(`/pages/${pageId}/content`, { raw: true });
-  const types = new Map();
-  for (const [tag] of html.matchAll(/<(?:img|object)\b[^>]*>/gi)) {
-    const url = tag.match(/\s(?:src|data)="([^"]*\/resources\/[^"]*)"/)?.[1];
-    const type = tag.match(/\s(?:data-src-type|type)="([^"]*)"/)?.[1];
-    if (url && type) types.set(url, type);
-  }
-  const urls = [...new Set([...html.matchAll(/https:\/\/graph\.microsoft\.com\/[^"]*?\/resources\/[^"/]+\/(?:\$value|content)/g)].map((m) => m[0]))];
-  const parts = [];
-  for (const [i, url] of urls.entries()) {
-    const resourceId = url.match(/resources\/([^"/]+)\//)[1];
-    const name = `res${i + 1}`;
-    parts.push({ name, type: types.get(url) || "application/octet-stream", data: await graph(`/resources/${encodeURIComponent(resourceId)}/content`, { binary: true }) });
-    html = html.split(url).join(`name:${name}`);
-  }
-  html = html.replace(/\sdata-fullres-src(?:-type)?="[^"]*"/g, "");
-  const req = multipart([{ name: "Presentation", type: "text/html", data: html }, ...parts]);
-  const page = await graph(`/sections/${destSectionId}/pages`, { method: "POST", ...req });
-  return { id: page.id, title: page.title, resourcesCopied: parts.length, webUrl: page.links?.oneNoteWebUrl?.href };
-}
-
-const notImplemented = (e) => /-> 501:/.test(e.message);
-
-// ---- Server ----
-const server = new McpServer({ name: "onenote", version: "2.0.0" });
-const RO = { readOnlyHint: true, openWorldHint: true };
-const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
-const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, openWorldHint: true };
-
-function tool(name, description, inputSchema, annotations, handler) {
-  if (READ_ONLY && !annotations.readOnlyHint) return;
-  server.registerTool(name, { description, inputSchema, annotations }, handler);
-}
-
-const sectionTarget = {
-  sectionId: z.string().optional().describe("Section id (takes precedence over names)"),
-  notebook: z.string().optional().describe("Notebook name"),
-  section: z.string().optional().describe("Section name"),
-  sectionGroup: z.string().optional().describe("Section group name, to pick a section inside a group"),
-};
+const withWarning = (result, warning) => (warning ? (typeof result === "string" ? `${result}\n${warning}` : { ...result, warning }) : result);
 
 // --- Notebooks ---
 tool(
@@ -279,12 +91,11 @@ tool(
   {},
   RO,
   async () => {
-    const [notebooks, groups, sections] = await Promise.all([
+    const [notebooks, groups, visible] = await Promise.all([
       getAll("/notebooks?$select=id,displayName,isDefault,isShared,userRole,createdDateTime,lastModifiedDateTime,links"),
       allSectionGroups(),
-      allSections(),
+      visibleSections(),
     ]);
-    const visible = sections.filter((s) => !isBlocked(s));
     const sectionsOf = (pred) => visible.filter(pred).map((s) => ({ name: s.displayName, id: s.id, ...(s.isDefault && { isDefault: true }) }));
     const groupTree = (pred) =>
       groups.filter(pred).map((g) => ({
@@ -352,6 +163,7 @@ tool(
     const existing = (await getAll(`${parentPath}/sectionGroups?$select=id,displayName`)).find((g) => same(g.displayName, name));
     if (existing) return text({ sectionGroup: existing.displayName, id: existing.id, created: false });
     const g = await graph(`${parentPath}/sectionGroups`, { method: "POST", contentType: "application/json", body: JSON.stringify({ displayName: name }) });
+    forgetSectionGroups();
     return text({ sectionGroup: g.displayName, id: g.id, created: true });
   }
 );
@@ -363,7 +175,7 @@ tool(
   { notebook: z.string().optional() },
   RO,
   async ({ notebook }) => {
-    const sections = (await allSections()).filter((s) => !isBlocked(s) && (!notebook || same(s.parentNotebook?.displayName, notebook)));
+    const sections = await visibleSections(notebook);
     return text(
       sections.map((s) => ({
         section: s.displayName,
@@ -383,10 +195,10 @@ tool(
   { notebook: z.string(), section: z.string(), sectionGroup: z.string().optional().describe("Create inside this section group") },
   WRITE,
   async ({ notebook, section, sectionGroup }) => {
-    if (isBlockedName(section)) throw new Error(BLOCKED_MSG);
-    const parentPath = sectionGroup
-      ? `/sectionGroups/${(await findSectionGroup(notebook, sectionGroup)).id}`
-      : `/notebooks/${(await findNotebook(notebook)).id}`;
+    checkNewSection(section, null);
+    const group = sectionGroup ? await findSectionGroup(notebook, sectionGroup) : null;
+    const parentPath = group ? `/sectionGroups/${group.id}` : `/notebooks/${(await findNotebook(notebook)).id}`;
+    checkNewSection(section, await containerPath(group?.parentNotebook?.displayName ?? notebook, group));
     const existing = (await getAll(`${parentPath}/sections?$select=id,displayName`)).find((x) => same(x.displayName, section));
     if (existing) return text({ section: existing.displayName, id: existing.id, created: false });
     const s = await graph(`${parentPath}/sections`, { method: "POST", contentType: "application/json", body: JSON.stringify({ displayName: section }) });
@@ -397,7 +209,7 @@ tool(
 tool(
   "copy_section",
   "Copy a section (with all its pages) into a notebook or section group. Work/school accounts copy in the background " +
-    "(check with get_operation); personal accounts copy page by page immediately (slower for big sections).",
+    "(check with get_operation); personal accounts copy page by page immediately (slower for big sections). Pages blocked by the guardrail are left out.",
   {
     ...sectionTarget,
     toNotebook: z.string().describe("Destination notebook name"),
@@ -406,40 +218,51 @@ tool(
   },
   WRITE,
   async ({ toNotebook, toSectionGroup, renameAs, ...src }) => {
-    const id = await resolveSection(src);
-    if (renameAs && isBlockedName(renameAs)) throw new Error(BLOCKED_MSG);
+    const source = await resolveSection(src);
+    const name = renameAs || source.name;
     const dest = toSectionGroup ? await findSectionGroup(toNotebook, toSectionGroup) : await findNotebook(toNotebook);
-    const action = toSectionGroup ? "copyToSectionGroup" : "copyToNotebook";
-    try {
-      const r = await graph(`/sections/${id}/${action}`, {
-        method: "POST",
-        contentType: "application/json",
-        body: JSON.stringify({ id: dest.id, ...(renameAs && { renameAs }) }),
-        full: true,
-      });
-      return text({ started: true, operationId: r.body?.id, status: r.body?.status, statusUrl: r.location });
-    } catch (e) {
-      if (!notImplemented(e)) throw e;
+    checkNewSection(name, await containerPath(toSectionGroup ? dest.parentNotebook?.displayName : dest.displayName, toSectionGroup ? dest : null), { write: true });
+    const pages = await getAll(`/sections/${source.id}/pages?$select=id,title&$orderby=createdDateTime asc&$top=100`);
+    const allowed = pages.filter((p) => !isPageBlocked(p, source));
+    // Graph's own copy takes every page, so only use it when no page in the section is blocked.
+    if (allowed.length === pages.length) {
+      const action = toSectionGroup ? "copyToSectionGroup" : "copyToNotebook";
+      try {
+        const r = await graph(`/sections/${source.id}/${action}`, {
+          method: "POST",
+          contentType: "application/json",
+          body: JSON.stringify({ id: dest.id, ...(renameAs && { renameAs }) }),
+          full: true,
+        });
+        return text({ started: true, operationId: r.body?.id, status: r.body?.status, statusUrl: r.location });
+      } catch (e) {
+        if (!notImplemented(e)) throw e;
+      }
     }
-    // Manual fallback: new section in the destination, then copy each page (oldest first).
-    const source = await graph(`/sections/${id}?$select=id,displayName`);
-    const name = renameAs || source.displayName;
+    // Manual copy: new section in the destination, then copy each allowed page (oldest first).
     const parentPath = toSectionGroup ? `/sectionGroups/${dest.id}` : `/notebooks/${dest.id}`;
     if ((await getAll(`${parentPath}/sections?$select=id,displayName`)).some((s) => same(s.displayName, name))) {
       throw new Error(`A section named "${name}" already exists there. Pass renameAs to copy under a new name.`);
     }
     const target = await graph(`${parentPath}/sections`, { method: "POST", contentType: "application/json", body: JSON.stringify({ displayName: name }) });
-    const pages = await getAll(`/sections/${id}/pages?$select=id,title&$orderby=createdDateTime asc&$top=100`);
     const copied = [];
     const failedPages = [];
-    for (const p of pages) {
+    for (const p of allowed) {
       try {
         copied.push((await copyPageManually(p.id, target.id)).title);
       } catch (err) {
         failedPages.push({ title: p.title, error: err.message.slice(0, 200) });
       }
     }
-    return text({ copied: true, method: "manual", section: name, sectionId: target.id, pagesCopied: copied.length, failedPages });
+    return text({
+      copied: true,
+      method: "manual",
+      section: name,
+      sectionId: target.id,
+      pagesCopied: copied.length,
+      failedPages,
+      ...(allowed.length < pages.length && { skippedByGuardrail: pages.length - allowed.length }),
+    });
   }
 );
 
@@ -454,12 +277,12 @@ tool(
   },
   RO,
   async ({ orderBy = "lastModifiedDateTime desc", limit = 100, ...target }) => {
-    const id = await resolveSection(target);
+    const section = await resolveSection(target);
     const pages = await getAll(
-      `/sections/${id}/pages?$select=id,title,createdDateTime,lastModifiedDateTime,level,order&$orderby=${encodeURIComponent(orderBy)}&$top=${Math.min(limit, 100)}`,
+      `/sections/${section.id}/pages?$select=id,title,createdDateTime,lastModifiedDateTime,level,order&$orderby=${encodeURIComponent(orderBy)}&$top=${Math.min(limit, 100)}`,
       limit
     );
-    return text(pages.map(pageSummary));
+    return text(pages.filter((p) => !isPageBlocked(p, section)).map(pageSummary));
   }
 );
 
@@ -471,17 +294,12 @@ tool(
   async ({ query, limit = 50, ...target }) => {
     const filter = `$filter=contains(tolower(title),'${q(query.toLowerCase())}')`;
     const select = "$select=id,title,createdDateTime,lastModifiedDateTime&$expand=parentSection($select=id,displayName)";
-    let sections;
-    if (target.sectionId || target.section) {
-      sections = [{ id: await resolveSection(target) }];
-    } else {
-      sections = (await allSections()).filter((s) => !isBlocked(s) && (!target.notebook || same(s.parentNotebook?.displayName, target.notebook)));
-    }
+    const sections = target.sectionId || target.section ? [{ info: await resolveSection(target) }] : await visibleSections(target.notebook);
     const results = [];
     for (const s of sections) {
       if (results.length >= limit) break;
-      const pages = await getAll(`/sections/${s.id}/pages?${filter}&${select}&$top=100`, limit - results.length);
-      results.push(...pages.filter((p) => !p.parentSection || !isBlocked(p.parentSection)));
+      const pages = await getAll(`/sections/${s.info.id}/pages?${filter}&${select}&$top=100`, limit - results.length);
+      results.push(...pages.filter((p) => !isPageBlocked(p, s.info)));
     }
     return text(results.map(pageSummary));
   }
@@ -501,19 +319,22 @@ tool(
       ),
       graph(`/pages/${pageId}/preview`).catch(() => null),
     ]);
-    return text({ ...pageSummary(p), notebook: p.parentNotebook?.displayName, createdByApp: p.createdByAppId, preview: preview?.previewText });
+    const versions = VERSIONING ? (await listVersions(pageId)).length : undefined;
+    return text({ ...pageSummary(p), notebook: p.parentNotebook?.displayName, createdByApp: p.createdByAppId, preview: preview?.previewText, versions });
   }
 );
 
 tool(
   "read_page",
-  "Read a page's content as HTML. Set includeIds=true to get element ids (data-id/id) to target with update_page. " +
-    "Tags show as data-tag (e.g. to-do, to-do:completed, important, question). Images/files show as resource URLs; save them with download_resource.",
-  { pageId: z.string(), includeIds: z.boolean().optional() },
+  "Read a page's content. format=html (default) returns OneNote HTML; set includeIds=true to get element ids (data-id/id) to target with update_page. " +
+    "Tags show as data-tag (e.g. to-do, to-do:completed, important, question). Images/files show as resource URLs; save them with download_resource. " +
+    "format=markdown or text returns a lighter, readable version.",
+  { pageId: z.string(), includeIds: z.boolean().optional(), format: readFormat },
   RO,
-  async ({ pageId, includeIds }) => {
+  async ({ pageId, includeIds, format = "html" }) => {
     await assertPageAllowed(pageId);
-    return text(await graph(`/pages/${pageId}/content${includeIds ? "?includeIDs=true" : ""}`, { raw: true }));
+    const html = await graph(`/pages/${pageId}/content${includeIds && format === "html" ? "?includeIDs=true" : ""}`, { raw: true });
+    return text(convert(html, format));
   }
 );
 
@@ -525,10 +346,11 @@ tool(
   { title: z.string(), bodyHtml: z.string(), ...sectionTarget, attachments: attachmentSchema },
   WRITE,
   async ({ title, bodyHtml, attachments, ...target }) => {
-    const id = await resolveSection(target);
+    const section = await resolveSection(target, { write: true });
+    checkNewPageTitle(title, section);
     const html = `<!DOCTYPE html><html><head><title>${esc(title)}</title><meta name="created" content="${new Date().toISOString()}" /></head><body>${bodyHtml}</body></html>`;
     const req = attachments?.length ? await buildMultipart(html, attachments, "text/html") : { body: html, contentType: "application/xhtml+xml" };
-    const page = await graph(`/sections/${id}/pages`, { method: "POST", ...req });
+    const page = await graph(`/sections/${section.id}/pages`, { method: "POST", ...req });
     return text({ created: page.title, id: page.id, webUrl: page.links?.oneNoteWebUrl?.href, clientUrl: page.links?.oneNoteClientUrl?.href });
   }
 );
@@ -538,7 +360,7 @@ tool(
   "Edit a page in place. Each change targets 'body', 'title', or an element by '#<data-id>' or its generated id (from read_page with includeIds=true). " +
     "Actions: append (end of target), prepend (start of target), insert (before/after target), replace (swap target; use target 'title' + replace " +
     "to rename the page). Example: tick a to-do with {target:'#task1', action:'replace', content:'<p data-tag=\"to-do:completed\" data-id=\"task1\">Done</p>'}. " +
-    "All changes in one call succeed or fail together.",
+    "All changes in one call succeed or fail together. A version of the page is saved first (see list_page_versions).",
   {
     pageId: z.string(),
     changes: z
@@ -555,22 +377,25 @@ tool(
   },
   DESTRUCTIVE,
   async ({ pageId, changes, attachments }) => {
-    await assertPageAllowed(pageId);
+    const page = await assertPageAllowed(pageId, { write: true });
+    for (const c of changes) if (c.target === "title" && c.action === "replace") checkNewPageTitle(c.content, page.section);
+    const warning = await snapshotBefore(page, "before update_page");
     const ops = changes.map((c) => ({ target: c.target, action: c.action, ...(c.position && { position: c.position }), content: c.content }));
     await patchPage(pageId, await resolveReplaceTargets(pageId, ops), attachments);
-    return text(`Applied ${ops.length} change(s).`);
+    return text(withWarning(`Applied ${ops.length} change(s).`, warning));
   }
 );
 
 tool(
   "append_to_page",
-  "Append HTML content to the end of an existing page.",
+  "Append HTML content to the end of an existing page. A version of the page is saved first.",
   { pageId: z.string(), html: z.string(), attachments: attachmentSchema },
   WRITE,
   async ({ pageId, html, attachments }) => {
-    await assertPageAllowed(pageId);
+    const page = await assertPageAllowed(pageId, { write: true });
+    const warning = await snapshotBefore(page, "before append_to_page");
     await patchPage(pageId, [{ target: "body", action: "append", content: html }], attachments);
-    return text("Appended.");
+    return text(withWarning("Appended.", warning));
   }
 );
 
@@ -587,19 +412,20 @@ tool(
   },
   WRITE,
   async ({ pageId, toSectionId, toNotebook, toSection, toSectionGroup }) => {
-    await assertPageAllowed(pageId);
-    const dest = await resolveSection({ sectionId: toSectionId, notebook: toNotebook, section: toSection, sectionGroup: toSectionGroup });
+    const page = await assertPageAllowed(pageId);
+    const dest = await resolveSection({ sectionId: toSectionId, notebook: toNotebook, section: toSection, sectionGroup: toSectionGroup }, { write: true });
+    checkNewPageTitle(page.title, dest);
     try {
       const r = await graph(`/pages/${pageId}/copyToSection`, {
         method: "POST",
         contentType: "application/json",
-        body: JSON.stringify({ id: dest }),
+        body: JSON.stringify({ id: dest.id }),
         full: true,
       });
       return text({ started: true, operationId: r.body?.id, status: r.body?.status, statusUrl: r.location });
     } catch (e) {
       if (!notImplemented(e)) throw e;
-      return text({ copied: true, method: "manual", ...(await copyPageManually(pageId, dest)) });
+      return text({ copied: true, method: "manual", ...(await copyPageManually(pageId, dest.id)) });
     }
   }
 );
@@ -630,7 +456,7 @@ tool(
     const content = await graph(`/pages/${pageId}/content`, { raw: true });
     if (!content.includes(resourceId)) throw new Error("That resource is not on this page.");
     const data = await graph(`/resources/${encodeURIComponent(resourceId)}/content`, { binary: true });
-    const out = resolve((outputPath || resolve(DOWNLOAD_DIR, resourceId)).replace(/^~(?=$|\/)/, homedir()));
+    const out = expandHome(outputPath || resolve(DOWNLOAD_DIR, resourceId));
     await mkdir(dirname(out), { recursive: true });
     await writeFile(out, data);
     return text({ saved: out, bytes: data.length });
@@ -638,16 +464,239 @@ tool(
 );
 
 if (ALLOW_DELETE) {
-  tool("delete_page", "Permanently delete a page. Cannot be undone through the API.", { pageId: z.string() }, DESTRUCTIVE, async ({ pageId }) => {
-    await assertPageAllowed(pageId);
-    await graph(`/pages/${pageId}`, { method: "DELETE" });
-    return text("Deleted.");
-  });
+  tool(
+    "delete_page",
+    "Permanently delete a page from OneNote. A version is saved first (when versioning is on), so it can be brought back with restore_page_version " +
+      "within the retention period.",
+    { pageId: z.string() },
+    DESTRUCTIVE,
+    async ({ pageId }) => {
+      const page = await assertPageAllowed(pageId, { write: true });
+      await snapshotBefore(page, "before delete_page", { required: true });
+      await graph(`/pages/${pageId}`, { method: "DELETE" });
+      return text(VERSIONING ? "Deleted. A version was saved; restore it with restore_page_version." : "Deleted.");
+    }
+  );
+}
+
+// --- Export ---
+const formatSchema = z.enum(FORMATS).describe("markdown, html, text, json or pdf (pdf needs Chrome, Edge, Chromium or Brave installed)");
+const resourcesSchema = z
+  .enum(["download", "inline", "none"])
+  .optional()
+  .describe("Images/files: download (default; saved in a folder next to the export), inline (embedded as data: URIs), or none. text ignores this; pdf always embeds.");
+
+const resourceMode = (format, resources = "download") => (format === "pdf" ? "inline" : format === "text" ? "none" : resources);
+
+// Export metadata for a page the guardrail already allowed.
+const exportMeta = (page) => ({
+  id: page.id,
+  title: page.title,
+  created: page.created,
+  modified: page.modified,
+  notebook: page.section.notebook,
+  section: page.section.name,
+  path: page.section.path ? `${page.section.path}/${page.title}` : undefined,
+  webUrl: page.webUrl,
+});
+
+tool(
+  "export_page",
+  "Export a page to a local file as Markdown, HTML, plain text, JSON or PDF, with its images and attached files.",
+  {
+    pageId: z.string(),
+    format: formatSchema,
+    resources: resourcesSchema,
+    outputPath: z.string().optional().describe("File (or existing folder) to write. Defaults to ONENOTE_EXPORT_DIR/<page title>.<ext>, never overwriting"),
+  },
+  WRITE,
+  async ({ pageId, format, resources, outputPath }) => {
+    const page = await assertPageAllowed(pageId);
+    const ext = EXT[format];
+    let out;
+    if (outputPath) {
+      out = expandHome(outputPath);
+      const isDir = /[\\/]$/.test(outputPath) || (await stat(out).then((s) => s.isDirectory(), () => false));
+      if (isDir) out = await uniquePath(join(out, safeName(page.title) + ext));
+    } else {
+      out = await uniquePath(join(EXPORT_DIR, safeName(page.title) + ext));
+    }
+    const assetsDir = out.slice(0, out.length - ext.length) + "_files";
+    const mode = resourceMode(format, resources);
+    const raw = await graph(`/pages/${pageId}/content`, { raw: true });
+    const { html, count } = await localizeResources(raw, mode, { assetsDir, assetsHref: basename(assetsDir) });
+    const bytes = await writeOutput(out, renderPage(exportMeta(page), html, format), format);
+    return text({ saved: out, format, bytes, resources: count, ...(mode === "download" && count && { resourcesDir: assetsDir }) });
+  }
+);
+
+tool(
+  "export_section",
+  "Export every page in a section to local files as Markdown, HTML, plain text, JSON or PDF. By default each page gets its own file in a folder " +
+    "named after the section (with an index for markdown/html); combine=true writes one file with all pages. Pages blocked by the guardrail are left out.",
+  {
+    ...sectionTarget,
+    format: formatSchema,
+    resources: resourcesSchema,
+    combine: z.boolean().optional().describe("One file for the whole section instead of one per page"),
+    outputDir: z.string().optional().describe("Folder to create the export in. Defaults to ONENOTE_EXPORT_DIR"),
+  },
+  WRITE,
+  async ({ format, resources, combine = false, outputDir, ...target }) => {
+    const section = await resolveSection(target);
+    const listed = await getAll(
+      `/sections/${section.id}/pages?$select=id,title,createdDateTime,lastModifiedDateTime,order,links&$orderby=createdDateTime asc&$top=100`
+    );
+    const pages = listed.filter((p) => !isPageBlocked(p, section)).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const base = outputDir ? expandHome(outputDir) : EXPORT_DIR;
+    const ext = EXT[format];
+    const mode = resourceMode(format, resources);
+    const meta = (p) =>
+      exportMeta({ id: p.id, title: p.title, created: p.createdDateTime, modified: p.lastModifiedDateTime, webUrl: p.links?.oneNoteWebUrl?.href, section });
+    const failedPages = [];
+    let resourceCount = 0;
+
+    if (combine) {
+      const out = await uniquePath(join(base, safeName(section.name) + ext));
+      const assetsDir = out.slice(0, out.length - ext.length) + "_files";
+      const rendered = [];
+      for (const p of pages) {
+        try {
+          const raw = await graph(`/pages/${p.id}/content`, { raw: true });
+          const { html, count } = await localizeResources(raw, mode, { assetsDir, assetsHref: basename(assetsDir) });
+          resourceCount += count;
+          rendered.push({ page: meta(p), html });
+        } catch (e) {
+          failedPages.push({ title: p.title, error: e.message.slice(0, 200) });
+        }
+      }
+      const bytes = await writeOutput(out, renderCombined(section, rendered, format), format);
+      return text({ saved: out, format, pages: rendered.length, bytes, resources: resourceCount, failedPages });
+    }
+
+    const dir = await uniquePath(join(base, safeName(section.name)));
+    const used = new Set();
+    const files = [];
+    for (const p of pages) {
+      try {
+        const out = await uniquePath(join(dir, safeName(p.title) + ext), used);
+        const raw = await graph(`/pages/${p.id}/content`, { raw: true });
+        const { html, count } = await localizeResources(raw, mode, { assetsDir: join(dir, "assets"), assetsHref: "assets" });
+        resourceCount += count;
+        await writeOutput(out, renderPage(meta(p), html, format), format);
+        files.push({ title: p.title || "Untitled", file: basename(out) });
+      } catch (e) {
+        failedPages.push({ title: p.title, error: e.message.slice(0, 200) });
+      }
+    }
+    if (format === "markdown" || format === "html") {
+      const link = (f) => encodeURI(f.file);
+      const index =
+        format === "markdown"
+          ? `# ${section.name}\n\n${files.map((f) => `- [${f.title}](${link(f)})`).join("\n")}\n`
+          : `<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8"><title>${esc(section.name)}</title></head><body>` +
+            `<h1>${esc(section.name)}</h1><ol>${files.map((f) => `<li><a href="${link(f)}">${esc(f.title)}</a></li>`).join("")}</ol></body></html>\n`;
+      await writeOutput(join(dir, `index${ext}`), index, format);
+    }
+    return text({ saved: dir, format, pages: files.length, resources: resourceCount, failedPages });
+  }
+);
+
+// --- Versions ---
+// Guardrail for a page's stored versions: check the live page, or the stored location if it was deleted.
+async function assertVersionsAllowed(pageId) {
+  try {
+    return await assertPageAllowed(pageId);
+  } catch (e) {
+    if (!notFound(e)) throw e;
+  }
+  const [latest] = await listVersions(pageId);
+  if (!latest) throw new Error("No versions saved for this page.");
+  checkStored({ id: pageId, title: latest.title }, { id: latest.sectionId, name: latest.section, path: latest.sectionPath ?? null });
+  return null;
+}
+
+if (VERSIONING) {
+  tool(
+    "snapshot_pages",
+    `Save a version of every page that changed since its last version, in one section, one notebook, or every section (no arguments). ` +
+      `Versions are kept for ${RETENTION_DAYS} days. Pages edited through this server are also saved automatically before each change.`,
+    { ...sectionTarget, force: z.boolean().optional().describe("Re-check every page's content, not just pages whose modified time changed") },
+    WRITE,
+    async ({ force, ...target }) => {
+      const sections =
+        target.sectionId || target.section ? [{ info: await resolveSection(target) }] : await visibleSections(target.notebook);
+      const complete = !target.sectionId && !target.section && !target.notebook;
+      return text(await snapshotSections(sections, { force, complete, reason: "manual" }));
+    }
+  );
+
+  tool(
+    "list_page_versions",
+    `List saved versions of a page (newest first). Without pageId, list every page that has versions, including deleted pages. ` +
+      `Versions are kept for ${RETENTION_DAYS} days.`,
+    { pageId: z.string().optional() },
+    RO,
+    async ({ pageId }) => {
+      if (pageId) {
+        await assertVersionsAllowed(pageId);
+        return text((await listVersions(pageId)).map(versionSummary));
+      }
+      const pages = (await listVersionedPages()).filter((p) => {
+        try {
+          checkStored({ id: p.pageId, title: p.title }, { id: p.sectionId, name: p.section, path: p.sectionPath ?? null });
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      return text(pages);
+    }
+  );
+
+  tool(
+    "read_page_version",
+    "Read a saved version of a page as html (default), markdown or text.",
+    { pageId: z.string(), versionId: z.string(), format: readFormat },
+    RO,
+    async ({ pageId, versionId, format = "html" }) => {
+      await assertVersionsAllowed(pageId);
+      const { meta, html } = await readVersion(pageId, versionId);
+      return text(`<!-- version ${meta.versionId} of "${meta.title}", captured ${meta.capturedAt} (${meta.reason}) -->\n${convert(html, format)}`);
+    }
+  );
+
+  tool(
+    "restore_page_version",
+    "Restore a saved version as a new page (with its images and files), in its original section or another one. " +
+      "The current page is left as it is; delete it afterwards if you want the restored copy to replace it.",
+    {
+      pageId: z.string(),
+      versionId: z.string(),
+      title: z.string().optional().describe('Title for the restored page. Defaults to "<original title> (restored)"'),
+      toSectionId: z.string().optional(),
+      toNotebook: z.string().optional(),
+      toSection: z.string().optional(),
+      toSectionGroup: z.string().optional(),
+    },
+    WRITE,
+    async ({ pageId, versionId, title, toSectionId, toNotebook, toSection, toSectionGroup }) => {
+      await assertVersionsAllowed(pageId);
+      const { meta, html } = await readVersion(pageId, versionId);
+      const dest = toSectionId || toSection
+        ? await resolveSection({ sectionId: toSectionId, notebook: toNotebook, section: toSection, sectionGroup: toSectionGroup }, { write: true })
+        : await resolveSection({ sectionId: meta.sectionId }, { write: true });
+      const newTitle = title || `${meta.title || "Untitled"} (restored)`;
+      checkNewPageTitle(newTitle, dest);
+      const page = await createPageFromHtml(dest.id, setTitle(html, newTitle), await versionResources(pageId, meta));
+      return text({ restored: true, from: meta.versionId, ...page, section: dest.name });
+    }
+  );
 }
 
 tool(
   "server_settings",
-  "Show this server's active settings (read-only mode, delete permission, defaults, blocked section count).",
+  "Show this server's active settings (read-only mode, delete permission, defaults, guardrail rule counts, versioning, export).",
   {},
   RO,
   async () =>
@@ -657,8 +706,21 @@ tool(
       defaultNotebook: DEFAULT_NOTEBOOK || null,
       defaultSection: DEFAULT_SECTION || null,
       downloadDir: DOWNLOAD_DIR,
-      blockedSections: BLOCKED_SECTIONS.length,
+      exportDir: EXPORT_DIR,
+      pdfBrowser: findBrowser(),
+      guardrail: {
+        blockedSections: RULES.blockedSections.length,
+        blockedPages: RULES.blockedPages.length,
+        protectedSections: RULES.protectedSections.length,
+        protectedPages: RULES.protectedPages.length,
+        pathRules: NEED_PATHS,
+        auditLog: AUDIT_LOG || null,
+      },
+      versioning: VERSIONING ? { retentionDays: RETENTION_DAYS, versionDir: VERSION_DIR } : false,
     })
 );
+
+// Age out old versions in the background; never blocks startup.
+if (VERSIONING) prune().catch(() => {});
 
 await server.connect(new StdioServerTransport());

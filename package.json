@@ -1,6 +1,6 @@
 {
   "name": "onenote-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "OneNote MCP server for Claude and other MCP clients (Microsoft Graph, device-code sign-in, no app registration)",
@@ -9,7 +9,8 @@
     "node": ">=18"
   },
   "bin": {
-    "onenote-mcp": "./server.js"
+    "onenote-mcp": "./server.js",
+    "onenote-mcp-snapshot": "./snapshot.js"
   },
   "scripts": {
     "login": "node auth.js login",
@@ -17,10 +18,13 @@
     "test:read": "node test/read-test.mjs",
     "test:write": "node test/write-test.mjs",
     "test:guardrail": "node test/guardrail-test.mjs",
-    "test:features": "node test/feature-test.mjs"
+    "test:features": "node test/feature-test.mjs",
+    "snapshot": "node snapshot.js",
+    "test:convert": "node test/convert-test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "turndown": "^7.2.5",
     "zod": "^4.6.7"
   }
 }

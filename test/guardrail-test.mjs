@@ -40,9 +40,16 @@ await expect("list_pages by name (other case) blocked", "list_pages", { notebook
 await expect("list_pages by id blocked", "list_pages", { sectionId: BLOCKED_ID }, true);
 await expect("search_pages blocked", "search_pages", { query: "", sectionId: BLOCKED_ID }, true);
 await expect("create_page blocked", "create_page", { title: "x", bodyHtml: "<p>x</p>", sectionId: BLOCKED_ID }, true);
+await expect("export_section blocked", "export_section", { sectionId: BLOCKED_ID, format: "markdown" }, true);
+await expect("snapshot_pages blocked", "snapshot_pages", { sectionId: BLOCKED_ID }, true);
+await expect("create_section with blocked name refused", "create_section", { notebook: NOTEBOOK, section: BLOCKED_NAME.toLowerCase() }, true);
 if (blockedPageId) {
   await expect("read_page blocked", "read_page", { pageId: blockedPageId }, true);
   await expect("append_to_page blocked", "append_to_page", { pageId: blockedPageId, html: "<p>x</p>" }, true);
+  await expect("read_page markdown blocked", "read_page", { pageId: blockedPageId, format: "markdown" }, true);
+  await expect("export_page blocked", "export_page", { pageId: blockedPageId, format: "text" }, true);
+  await expect("list_page_versions blocked", "list_page_versions", { pageId: blockedPageId }, true);
+  await expect("copy_page from blocked section refused", "copy_page", { pageId: blockedPageId, toNotebook: NOTEBOOK, toSection: SECTION }, true);
 } else console.log(`SKIP  page-level checks (${BLOCKED_NAME} has no pages)`);
 await expect(`${SECTION} list_pages still works`, "list_pages", { notebook: NOTEBOOK, section: SECTION }, false);
 
